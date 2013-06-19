@@ -1,12 +1,11 @@
 from StringIO import StringIO
 
 from fabric.api import *
+from fabric.contrib.files import append
 
 # Best to leave GRAPHITE_ROOT as is, since this appears to be standard from graphite
 # installes and I have not tested other destinations.
 GRAPHITE_ROOT='/opt/graphite'
-# This is currently only for the servername in the nginx config.
-SERVER_NAME='graphite-test'
 # This is for the graphite django webapp. Not providing this correctly will result
 # it your metrics being display at the wrong time. Presumedly metrics are
 # stored in unix time everywhere else...
@@ -61,7 +60,8 @@ def install_carbon():
 
     carbon_conf = """description "carbon writer"
 
-start on runlevel [2345] stop on runlevel [016]
+start on startup
+stop on shutdown
 
 expect daemon
 
@@ -109,7 +109,7 @@ def setup_nginx_and_uwsgi():
     nginx_conf = """server {
   listen 80;
   keepalive_timeout 60;
-  server_name %s localhost;
+  server_name _;
   charset utf-8;
   location / {
     include uwsgi_params;
@@ -122,7 +122,7 @@ def setup_nginx_and_uwsgi():
     alias /opt/graphite/webapp/content/;
     autoindex off;
   }
-}""" % (SERVER_NAME,)
+}"""
     put(StringIO(nginx_conf), '/etc/nginx/sites-available/graphite', use_sudo=True)
     sudo('rm /etc/nginx/sites-available/default')
 
@@ -169,7 +169,7 @@ def web_permissions():
 
 @task
 def setup_graphite():
-    #run_updates()
+    run_updates()
     add_graphite_user_and_dir()
 
     install_ceres()
@@ -182,6 +182,7 @@ def setup_graphite():
     # start services
     sudo('service nginx restart')
     sudo('service uwsgi restart')
+
 
 @task
 def setup_node():
@@ -200,7 +201,6 @@ def setup_node():
 }
 """
         put(StringIO(statsd_config), '/opt/statsd/localConfig.js', use_sudo=True)
-
 
 
 @task
@@ -256,6 +256,7 @@ def get_ruby():
       rubygems1.9.1 irb1.9.1 ri1.9.1 rdoc1.9.1 \
       build-essential libopenssl-ruby1.9.1 libssl-dev zlib1g-dev""")
 
+
     sudo(r"""update-alternatives --install /usr/bin/ruby ruby /usr/bin/ruby1.9.1 400 \
              --slave   /usr/share/man/man1/ruby.1.gz ruby.1.gz \
                             /usr/share/man/man1/ruby1.9.1.1.gz \
@@ -271,14 +272,23 @@ def get_ruby():
 
 @task
 def setup_team_dashboard(PG_DB):
-    #get_ruby()
-    sudo("apt-get install -y libpq-dev")
-    with cd(GRAPHITE_ROOT + '/src'):
+    """
+    Because the intent is to install into an LXC, and we are using this
+    for internal network use, we assume that PG has pg_hba.conf setup
+    to allow trusted connections (i.e. no authentication required).
+
+    We also assume a teamdashboard user exists with createdb permissions.
+    """
+    sudo('apt-get install -y postgresql-client libpq-dev libxml2-dev libmysqlclient-dev libxslt-dev')
+    get_ruby()
+    with cd('/opt/'):
         sudo('git clone https://github.com/fdietz/team_dashboard.git')
+        
         sudo('gem install bundler')
-        sudo('bundle install')
-        sudo('gem install pg')
-        db_conf="""common: &common
+        with cd('team_dashboard'):
+            append('Gemfile', 'gem "pg"')
+            sudo('bundle install')
+            db_conf="""common: &common
   adapter: postgresql
   host: %s
   username: teamdashboard 
@@ -294,15 +304,81 @@ test:
 production:
   <<: *common
   database: team_dashboard_production
-""" % PG_DB
-        put(StringIO(db_conf), 'config/database.yml', use_sudo=True)
-        sudo('rake db:create')
-        sudo('rake db:migrate')
+    """ % PG_DB
+            put(StringIO(db_conf), 'config/database.yml', use_sudo=True)
 
+            sudo("sed -i 's/^listen /^#listen /' config/unicorn.rb")
+            append('config/unicorn.rb', """
+listen "/tmp/.unicorn.sock.0", :backlog => 64
+listen "/tmp/.unicorn.sock.1", :backlog => 64
+""")
+            sudo('rake db:create')
+            sudo('rake db:migrate')
+            sudo('rake assets:precompile')
+
+    td_nginx = """
+upstream backend {
+    server unix:/tmp/.unicorn.sock.0;
+    server unix:/tmp/.unicorn.sock.1;
+}
+ 
+server {
+    listen 8081;
+    server_name _; # all accept
+    access_log /var/log/nginx/access.log;
+     
+    location ~ ^/assets/ {
+        root /opt/team_dashboard/public;
+        gzip_static on; # to serve pre-gzipped version
+        expires 1y;
+        add_header Cache-Control public;
+        add_header ETag "";
+        break;
+    }
+     
+    location / {
+        proxy_set_header HOST $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+        proxy_pass http://backend;
+        proxy_redirect off;
+    }
+}
+    """
+    put(StringIO(td_nginx), '/etc/nginx/sites-available/teamdashboard', use_sudo=True)
+    sudo("ln -s /etc/nginx/sites-available/teamdashboard /etc/nginx/sites-enabled/teamdashboard")
+
+    setup_unicorn()
+    sudo('service nginx restart')
+
+
+def setup_unicorn():
+    unicorn_upstart = """#!upstart
+start on startup
+stop on shutdown
+
+respawn
+
+env USER=www-data
+env PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+env PORT=5200
+env RAILS_ENV=production
+env GRAPHITE_URL=http://localhost:80
+env QUEUE=teamdashboard
+
+#exec start-stop-daemon --make-pidfile --pidfile /var/run/teamdashboard.pid --chuid $USER --start -c app -d /var/www/teamdashboard -x /usr/local/bin/bundle -- exec unicorn -c config/unicorn.rb >> /var/log/teamdashboard/web.log 2>&1"""
+
+    put(StringIO(unicorn_upstart), '/etc/init/teamdashboard.conf', use_sudo=True)
+    sudo('mkdir -p /var/log/teamdashboard')
+    sudo('chown -R www-data:www-data /var/log/teamdashboard')
+
+    sudo('service unicorn restart')
 
 
 @task
-def monitor_all_the_things():
+def monitor_all_the_things(PG_DB):
     setup_graphite()
     setup_statsd()
+    setup_team_dashboard(PG_DB)
 
