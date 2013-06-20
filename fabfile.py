@@ -1,15 +1,24 @@
 from StringIO import StringIO
 
 from fabric.api import *
+from fabric.context_managers import shell_env
 from fabric.contrib.files import append
+
 
 # Best to leave GRAPHITE_ROOT as is, since this appears to be standard from graphite
 # installes and I have not tested other destinations.
 GRAPHITE_ROOT='/opt/graphite'
+
 # This is for the graphite django webapp. Not providing this correctly will result
 # it your metrics being display at the wrong time. Presumedly metrics are
 # stored in unix time everywhere else...
+#
+# TODO: update team_dashboard's config/application.rb to use this timezone too.
+# Currently you need to manually add:
+#   config.time_zone = 'Auckland'
+#   config.active_record.default_timezone = 'Auckland'
 TIMEZONE='Pacific/Auckland'
+
 
 def run_updates():
     sudo('apt-get update')
@@ -27,12 +36,14 @@ def run_updates():
     # Not needed, because we assume we are in a LXC
     #sudo('pip install -U virtualenvwrapper') # Get the latest virtualenvwrapper 
 
+
 def add_graphite_user_and_dir():
     sudo('adduser --gecos "" --disabled-password --quiet graphite')
 
     sudo('mkdir -p /opt/graphite')
     sudo('mkdir -p /opt/graphite/src')
     sudo('chown -R graphite:graphite /opt/graphite')
+
 
 def install_ceres():
     with cd(GRAPHITE_ROOT + '/src'):
@@ -42,6 +53,7 @@ def install_ceres():
             sudo('python setup.py install')
 
         sudo('ceres-tree-create /opt/graphite/storage/ceres')
+
 
 def install_carbon():
     with cd(GRAPHITE_ROOT + '/src'):
@@ -85,6 +97,7 @@ check process python with pidfile "/var/run/carbon-writer.pid"
 
     sudo('/etc/init.d/monit restart')
 
+
 def install_webapp():
     with cd(GRAPHITE_ROOT + '/src'):
         put(StringIO('from cairocffi import *'), '/usr/local/lib/python2.7/dist-packages/cairo.py', use_sudo=True)
@@ -104,6 +117,7 @@ def install_webapp():
             if TIMEZONE:
                 sudo("sed -i -e 's/^#TIMEZONE = .*$/TIMEZONE = \"%s\"/' local_settings.py" % TIMEZONE.replace('/', '\/'))
             sudo('python manage.py syncdb --noinput')
+
 
 def setup_nginx_and_uwsgi():
     nginx_conf = """server {
@@ -161,6 +175,7 @@ def fix_permissions():
     sudo("chmod u+rwX -R /opt/graphite/")
     sudo("chmod g+rwX -R /opt/graphite/")
     sudo("chmod o-rw -R /opt/graphite/")
+
 
 def web_permissions():
     sudo("chown -R graphite.www-data /opt/graphite/webapp/content")
@@ -270,6 +285,7 @@ def get_ruby():
     sudo('update-alternatives --config ruby')
     sudo('update-alternatives --config gem')
 
+
 @task
 def setup_team_dashboard(PG_DB):
     """
@@ -312,9 +328,10 @@ production:
 listen "/tmp/.unicorn.sock.0", :backlog => 64
 listen "/tmp/.unicorn.sock.1", :backlog => 64
 """, use_sudo=True)
-            sudo('rake db:create')
-            sudo('rake db:migrate')
-            sudo('rake assets:precompile')
+            with shell_env(RAILS_ENV=production):
+                sudo('rake db:create')
+                sudo('rake db:migrate')
+                sudo('rake assets:precompile')
 
     td_nginx = """
 upstream backend {
