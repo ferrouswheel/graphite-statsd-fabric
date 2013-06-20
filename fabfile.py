@@ -96,14 +96,14 @@ def install_webapp():
             sudo('pip install cairocffi')
             sudo('python setup.py install')
 
-        with cd(GRAPHITE_ROOT + '/webapp/'):
-            sudo("cp /opt/graphite/conf/graphite.wsgi.example wsgi.py")
+    with cd(GRAPHITE_ROOT + '/webapp/'):
+        sudo("cp /opt/graphite/conf/graphite.wsgi.example wsgi.py")
 
-            with cd('graphite'):
-                sudo("cp local_settings.py.template local_settings.py")
-                if TIMEZONE:
-                    sudo("sed -i -e 's/^#TIMEZONE = .*$/TIMEZONE = \"%s\"/'  /usr/share/uwsgi/conf/default.ini" % TIMEZONE)
-                sudo('python manage.py syncdb --noinput')
+        with cd('graphite'):
+            sudo("cp local_settings.py.example local_settings.py")
+            if TIMEZONE:
+                sudo("sed -i -e 's/^#TIMEZONE = .*$/TIMEZONE = \"%s\"/' local_settings.py" % TIMEZONE.replace('/', '\/'))
+            sudo('python manage.py syncdb --noinput')
 
 def setup_nginx_and_uwsgi():
     nginx_conf = """server {
@@ -286,7 +286,7 @@ def setup_team_dashboard(PG_DB):
         
         sudo('gem install bundler')
         with cd('team_dashboard'):
-            append('Gemfile', 'gem "pg"')
+            append('Gemfile', 'gem "pg"', use_sudo=True)
             sudo('bundle install')
             db_conf="""common: &common
   adapter: postgresql
@@ -311,7 +311,7 @@ production:
             append('config/unicorn.rb', """
 listen "/tmp/.unicorn.sock.0", :backlog => 64
 listen "/tmp/.unicorn.sock.1", :backlog => 64
-""")
+""", use_sudo=True)
             sudo('rake db:create')
             sudo('rake db:migrate')
             sudo('rake assets:precompile')
@@ -362,7 +362,6 @@ respawn
 
 env USER=www-data
 env PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-env PORT=5200
 env RAILS_ENV=production
 env GRAPHITE_URL=http://localhost:80
 env QUEUE=teamdashboard
@@ -373,7 +372,7 @@ env QUEUE=teamdashboard
     sudo('mkdir -p /var/log/teamdashboard')
     sudo('chown -R www-data:www-data /var/log/teamdashboard')
 
-    sudo('service unicorn restart')
+    sudo('service teamdashboard restart')
 
 
 @task
